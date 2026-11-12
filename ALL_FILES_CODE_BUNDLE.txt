@@ -1,0 +1,641 @@
+
+========================================================================================
+FILE: app.py
+========================================================================================
+from pathlib import Path
+from typing import Optional
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from rag_engine import RAGEngine
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+STATIC_DIR = BASE_DIR / "static"
+
+app = FastAPI(
+    title="Greenko Energy Intelligence",
+    description="Document-grounded RAG assistant for renewable-energy operations.",
+    version="1.0.0",
+)
+engine = RAGEngine(DATA_DIR)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+class QueryRequest(BaseModel):
+    text: str = Field(..., min_length=3, max_length=1000)
+    top_k: int = Field(default=3, ge=1, le=5)
+
+@app.on_event("startup")
+def startup_event():
+    engine.load_knowledge_base()
+
+@app.get("/")
+def home():
+    return FileResponse(STATIC_DIR / "index.html")
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "app": "Greenko Energy Intelligence", **engine.status()}
+
+@app.get("/api/documents")
+def documents():
+    return {"documents": engine.list_documents()}
+
+@app.post("/api/run")
+def run_query(request: QueryRequest):
+    return engine.answer(request.text, request.top_k)
+
+@app.get("/api/evaluate")
+def evaluate():
+    return engine.evaluate()
+
+
+========================================================================================
+FILE: rag_engine.py
+========================================================================================
+import os
+import re
+import csv
+import time
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
+
+
+class RAGEngine:
+    """
+    Lightweight RAG pipeline:
+    documents -> chunks -> embeddings -> cosine retrieval -> grounded answer.
+    Sentence Transformers creates dense semantic embeddings when available.
+    TF-IDF is a transparent fallback if the model cannot be loaded.
+    """
+
+    def __init__(self, data_dir: Path):
+        self.data_dir = Path(data_dir)
+        self.chunks: List[Dict[str, Any]] = []
+        self.embedder = None
+        self.vectorizer = None
+        self.matrix = None
+        self.embedding_mode = "not_loaded"
+        self.model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        self.groq_client = None
+        self.llm_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+        api_key = os.getenv("GROQ_API_KEY")
+        if api_key and Groq:
+            self.groq_client = Groq(api_key=api_key)
+
+    def _chunk_text(self, text: str, source: str, chunk_size: int = 85, overlap: int = 20):
+        # Word-based chunking keeps short operational SOPs intact while supporting larger files.
+        words = re.findall(r"\S+", text)
+        if not words:
+            return []
+        chunks = []
+        start = 0
+        while start < len(words):
+            end = min(start + chunk_size, len(words))
+            content = " ".join(words[start:end]).strip()
+            chunks.append({
+                "source": source,
+                "text": content,
+                "chunk_id": f"{Path(source).stem}-{len(chunks)+1}",
+                "start_word": start,
+                "end_word": end,
+            })
+            if end == len(words):
+                break
+            start = max(end - overlap, start + 1)
+        return chunks
+
+    def load_knowledge_base(self):
+        self.chunks = []
+        for path in sorted(self.data_dir.glob("*.md")):
+            raw = path.read_text(encoding="utf-8").strip()
+            # Keep document heading and body together as source evidence.
+            self.chunks.extend(self._chunk_text(raw, path.name))
+        if not self.chunks:
+            self.matrix = None
+            return
+
+        texts = [item["text"] for item in self.chunks]
+        if SentenceTransformer is not None:
+            try:
+                self.embedder = SentenceTransformer(self.model_name)
+                self.matrix = self.embedder.encode(
+                    texts, convert_to_numpy=True, normalize_embeddings=True
+                )
+                self.embedding_mode = f"dense_sentence_transformer:{self.model_name}"
+                return
+            except Exception as exc:
+                print(f"SentenceTransformer unavailable; using TF-IDF fallback: {exc}")
+
+        self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english")
+        self.matrix = self.vectorizer.fit_transform(texts)
+        self.embedding_mode = "sparse_tfidf_fallback"
+
+    def _retrieve(self, question: str, top_k: int):
+        if not self.chunks or self.matrix is None:
+            return []
+        if self.embedder is not None:
+            q_vec = self.embedder.encode([question], convert_to_numpy=True, normalize_embeddings=True)
+            scores = np.dot(self.matrix, q_vec[0])
+            scores = np.asarray(scores).reshape(-1)
+        else:
+            q_vec = self.vectorizer.transform([question])
+            scores = cosine_similarity(q_vec, self.matrix)[0]
+        order = np.argsort(scores)[::-1][:top_k]
+        return [
+            {**self.chunks[int(i)], "score": float(scores[int(i)])}
+            for i in order
+        ]
+
+    def _call_llm(self, question: str, evidence: List[Dict[str, Any]]) -> Optional[str]:
+        if not self.groq_client:
+            return None
+        context = "\n\n".join(
+            f"[Source: {item['source']} | Chunk: {item['chunk_id']}]\n{item['text']}"
+            for item in evidence
+        )
+        system_prompt = (
+            "You are an operational document assistant. Answer ONLY using the supplied context. "
+            "Do not use outside knowledge, invent thresholds, or add procedures not stated in context. "
+            "If the context does not contain the answer, say the documents do not provide enough information. "
+            "For safety-related questions, repeat only the source's stated checks and say to follow approved site procedures. "
+            "Be concise and cite source filenames in square brackets."
+        )
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.llm_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+                ],
+                temperature=0.1,
+                max_tokens=350,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as exc:
+            print(f"LLM request failed; using extractive fallback: {exc}")
+            return None
+
+    @staticmethod
+    def _token_overlap(answer: str, evidence_text: str) -> float:
+        stop = {"the","and","for","with","from","that","this","are","you","should","what","when","into","your","can","may","not","only"}
+        a = {w.lower() for w in re.findall(r"[a-zA-Z0-9]+", answer) if len(w) > 2 and w.lower() not in stop}
+        e = {w.lower() for w in re.findall(r"[a-zA-Z0-9]+", evidence_text) if len(w) > 2 and w.lower() not in stop}
+        if not a:
+            return 0.0
+        return len(a & e) / len(a)
+
+    def answer(self, question: str, top_k: int = 3):
+        started = time.time()
+        evidence = self._retrieve(question, top_k)
+        threshold = float(os.getenv("RETRIEVAL_THRESHOLD", "0.12" if "tfidf" in self.embedding_mode else "0.25"))
+        best_score = evidence[0]["score"] if evidence else 0.0
+
+        if not evidence or best_score < threshold:
+            return {
+                "question": question,
+                "answer": "I couldn't find sufficient supporting information in the provided Greenko documents. Please consult the approved operational procedure or responsible site team.",
+                "supported": False,
+                "guardrail": "abstained_low_retrieval_score",
+                "retrieval_score": round(best_score, 4),
+                "citations": [],
+                "retrieval_evidence": [],
+                "embedding_mode": self.embedding_mode,
+                "llm_used": False,
+                "latency_ms": round((time.time() - started) * 1000, 2),
+            }
+
+        llm_answer = self._call_llm(question, evidence)
+        if llm_answer:
+            answer_text = llm_answer
+            llm_used = True
+        else:
+            # Safe extractive fallback: return the source text rather than inventing an answer.
+            answer_text = "Based on the retrieved operational document: " + " ".join(
+                item["text"] for item in evidence[:2]
+            )
+            llm_used = False
+
+        evidence_text = " ".join(item["text"] for item in evidence)
+        overlap = self._token_overlap(answer_text, evidence_text)
+        # This is a heuristic grounding signal, not a formal proof of factual correctness.
+        grounded = overlap >= 0.20 and best_score >= threshold
+        if not grounded:
+            answer_text = (
+                "The retrieved documents may be relevant, but I cannot verify that a complete answer "
+                "is supported by their text. Please review the cited evidence and approved site procedure."
+            )
+
+        citations = []
+        seen = set()
+        for item in evidence:
+            if item["source"] not in seen:
+                citations.append({"source": item["source"], "chunk_id": item["chunk_id"]})
+                seen.add(item["source"])
+
+        return {
+            "question": question,
+            "answer": answer_text,
+            "supported": bool(grounded),
+            "guardrail": "passed_heuristic_grounding_check" if grounded else "flagged_possible_unsupported_content",
+            "grounding_overlap": round(overlap, 4),
+            "retrieval_score": round(best_score, 4),
+            "citations": citations,
+            "retrieval_evidence": [
+                {
+                    "source": item["source"],
+                    "chunk_id": item["chunk_id"],
+                    "score": round(item["score"], 4),
+                    "text": item["text"],
+                } for item in evidence
+            ],
+            "embedding_mode": self.embedding_mode,
+            "llm_used": llm_used,
+            "latency_ms": round((time.time() - started) * 1000, 2),
+        }
+
+    def list_documents(self):
+        return [
+            {"filename": p.name, "characters": len(p.read_text(encoding="utf-8"))}
+            for p in sorted(self.data_dir.glob("*.md"))
+        ]
+
+    def status(self):
+        return {
+            "document_count": len(self.list_documents()),
+            "chunk_count": len(self.chunks),
+            "embedding_mode": self.embedding_mode,
+            "llm_configured": self.groq_client is not None,
+        }
+
+    def evaluate(self):
+        csv_path = self.data_dir / "questions.csv"
+        if not csv_path.exists():
+            return {"message": "questions.csv not found", "tests": []}
+        tests = []
+        hits = 0
+        total = 0
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                question = row.get("question", "").strip()
+                expected = row.get("expected_source", "").strip()
+                if not question or not expected:
+                    continue
+                result = self.answer(question, top_k=3)
+                returned = [c["source"] for c in result["citations"]]
+                hit = expected in returned
+                hits += int(hit)
+                total += 1
+                tests.append({
+                    "question": question,
+                    "expected_source": expected,
+                    "retrieved_sources": returned,
+                    "source_hit": hit,
+                    "supported": result["supported"],
+                    "retrieval_score": result["retrieval_score"],
+                })
+        return {
+            "total_questions": total,
+            "source_hit_rate": round(hits / total, 4) if total else 0,
+            "note": "Source hit rate is measured against the supplied expected_source labels; the bundled CSV contains only two labelled examples.",
+            "tests": tests,
+        }
+
+
+========================================================================================
+FILE: requirements.txt
+========================================================================================
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+pydantic==2.10.6
+numpy==2.2.3
+scikit-learn==1.6.1
+sentence-transformers==3.4.1
+groq==0.18.0
+python-dotenv==1.0.1
+
+
+========================================================================================
+FILE: Procfile
+========================================================================================
+web: uvicorn app:app --host 0.0.0.0 --port $PORT
+
+
+========================================================================================
+FILE: .env.example
+========================================================================================
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=openai/gpt-oss-20b
+EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+RETRIEVAL_THRESHOLD=0.25
+
+
+========================================================================================
+FILE: data/solar_inverter_sop.md
+========================================================================================
+# Solar Inverter SOP
+If inverter temperature exceeds 75C, inspect cooling fans, dust filters, ambient temperature, and DC input imbalance. If repeated derating occurs, create a priority maintenance ticket and verify SCADA alarms.
+
+
+========================================================================================
+FILE: data/wind_turbine_maintenance.md
+========================================================================================
+# Wind Turbine Maintenance
+High gearbox vibration combined with rising nacelle temperature may indicate lubrication issues or bearing wear. Recommended checks: vibration spectrum, oil level, oil contamination, and recent wind gust events.
+
+
+========================================================================================
+FILE: data/hydro_safety_brief.md
+========================================================================================
+# Hydro Safety Brief
+Before spillway gate inspection, verify lockout-tagout, water level, upstream flow, communication with control room, and emergency evacuation route readiness.
+
+
+========================================================================================
+FILE: data/grid_operations_note.md
+========================================================================================
+# Grid Operations Note
+Generation deviation should be reviewed against forecast, irradiation, wind speed, outage logs, curtailment instructions, and grid frequency events before escalation.
+
+
+========================================================================================
+FILE: data/questions.csv
+========================================================================================
+question,expected_source
+What should be checked for inverter derating?,solar_inverter_sop.md
+How should gearbox vibration be investigated?,wind_turbine_maintenance.md
+
+
+========================================================================================
+FILE: static/index.html
+========================================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Greenko Energy Intelligence</title>
+<style>
+:root{--green:#123b2b;--green2:#1e6848;--mint:#eaf5ee;--ink:#17251e;--muted:#65736b;--line:#e1e9e3;--bg:#f5f8f5;--white:#fff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}
+header{background:linear-gradient(115deg,#0d2d22,#1e6848);color:white;padding:26px max(22px,calc((100% - 1160px)/2));}
+.brand{display:flex;align-items:center;gap:12px}.logo{width:42px;height:42px;border-radius:12px;background:#ffffff20;display:grid;place-items:center;font-size:22px}
+header h1{font-size:clamp(22px,3vw,30px);margin:0}header p{margin:7px 0 0;color:#d8e8dd;font-size:14px}
+.wrap{max-width:1160px;margin:28px auto;padding:0 20px}.layout{display:grid;grid-template-columns:1.5fr .8fr;gap:20px;align-items:start}
+.panel{background:white;border:1px solid var(--line);border-radius:17px;padding:22px;box-shadow:0 7px 25px #163a2410;margin-bottom:18px}
+h2{font-size:18px;margin:0 0 8px;color:var(--green)}.sub{font-size:13px;color:var(--muted);margin:0 0 18px}
+textarea{width:100%;min-height:110px;border:1px solid #cfdbd1;border-radius:12px;padding:14px;font:inherit;resize:vertical;outline:none}textarea:focus{border-color:var(--green2);box-shadow:0 0 0 3px #1e68481c}
+.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}button{border:0;border-radius:10px;padding:11px 16px;background:var(--green);color:white;font-weight:650;cursor:pointer}button:hover{background:var(--green2)}button:disabled{opacity:.55;cursor:wait}.secondary{background:#edf4ef;color:var(--green)}.secondary:hover{background:#dcebe0}
+.samples{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{background:#f1f6f2;border:1px solid #dce8df;color:#315d43;border-radius:99px;padding:7px 10px;font-size:12px;cursor:pointer}
+.answer{white-space:pre-wrap;line-height:1.65;font-size:14px}.status{display:inline-flex;align-items:center;gap:6px;border-radius:99px;padding:6px 10px;font-size:12px;font-weight:700;margin-bottom:12px}.good{background:#e7f5eb;color:#17633b}.bad{background:#fff1e8;color:#9a4b16}
+.source{border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:10px}.source b{font-size:13px;color:var(--green)}.source p{font-size:12px;line-height:1.5;color:#536158;margin:7px 0 0}.score{font-size:11px;color:var(--muted)}
+.statgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.stat{background:#f5f8f5;border-radius:12px;padding:13px}.stat strong{font-size:22px;color:var(--green);display:block}.stat span{font-size:11px;color:var(--muted)}
+.doc{display:flex;align-items:center;gap:9px;padding:10px 0;border-bottom:1px solid #edf1ed;font-size:13px}.doc:last-child{border:0}.dot{width:8px;height:8px;border-radius:50%;background:#54a477}
+.hidden{display:none}.error{color:#a33;font-size:13px}.foot{text-align:center;color:#859188;font-size:12px;padding:16px}
+@media(max-width:820px){.layout{grid-template-columns:1fr}.wrap{margin-top:18px;padding:0 14px}.panel{padding:18px}header{padding:22px 18px}}
+</style>
+</head>
+<body>
+<header><div class="brand"><div class="logo">⚡</div><div><h1>Greenko Energy Intelligence</h1><p>AI-powered operational document assistant · Renewable energy knowledge base</p></div></div></header>
+<main class="wrap">
+<div class="layout">
+<div>
+<section class="panel">
+<h2>Ask the operations assistant</h2><p class="sub">Ask a question about the supplied solar, wind, hydro or grid operations documents.</p>
+<textarea id="question" placeholder="Example: What should be checked if an inverter temperature exceeds 75°C?"></textarea>
+<div class="actions"><button id="askBtn" onclick="ask()">Search documents & answer</button><button class="secondary" onclick="clearAll()">Clear</button><span id="busy" class="sub hidden">Retrieving evidence…</span></div>
+<div class="samples">
+<span class="chip" onclick="useSample('What should be checked for inverter derating?')">Solar inverter derating</span>
+<span class="chip" onclick="useSample('How should gearbox vibration be investigated?')">Wind gearbox vibration</span>
+<span class="chip" onclick="useSample('What checks are required before spillway gate inspection?')">Hydro safety checks</span>
+<span class="chip" onclick="useSample('What should be reviewed when generation deviates from forecast?')">Grid generation deviation</span>
+<span class="chip" onclick="useSample('What is the procedure for repairing a nuclear reactor?')">Out-of-scope test</span>
+</div>
+</section>
+<section class="panel hidden" id="resultPanel">
+<h2>Assistant response</h2><div id="supportStatus"></div><div class="answer" id="answer"></div>
+<div id="meta" class="sub" style="margin-top:14px"></div>
+<h2 style="margin-top:22px">Citations & retrieved evidence</h2><div id="sources"></div>
+</section>
+</div>
+<aside>
+<section class="panel"><h2>Knowledge base</h2><p class="sub">Documents indexed for retrieval</p><div id="docs"><div class="sub">Loading documents…</div></div></section>
+<section class="panel"><h2>System status</h2><div class="statgrid"><div class="stat"><strong id="docCount">—</strong><span>Documents</span></div><div class="stat"><strong id="chunkCount">—</strong><span>Chunks</span></div></div><p class="sub" id="mode" style="margin:12px 0 0">Checking embedding model…</p><p class="sub" id="llm" style="margin:7px 0 0">Checking LLM…</p></section>
+<section class="panel"><h2>Evaluation</h2><p class="sub">Run the labelled sample questions from the supplied CSV.</p><button class="secondary" onclick="evaluateTests()">Run evaluation</button><div id="evalResult" class="sub" style="margin:12px 0 0"></div></section>
+</aside>
+</div>
+<div class="foot">Prototype for document-grounded decision support. Always follow approved site procedures and authorized safety controls.</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function useSample(q){$('question').value=q;$('question').focus()}
+function clearAll(){$('question').value='';$('resultPanel').classList.add('hidden');$('evalResult').textContent=''}
+async function loadStatus(){
+ try{
+  const [h,d]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/documents').then(r=>r.json())]);
+  $('docCount').textContent=h.document_count;$('chunkCount').textContent=h.chunk_count;
+  $('mode').textContent='Embeddings: '+h.embedding_mode;$('llm').textContent='LLM: '+(h.llm_configured?'Groq connected':'Extractive fallback active');
+  $('docs').innerHTML=d.documents.map(x=>`<div class="doc"><span class="dot"></span><span>${escapeHtml(x.filename)}</span></div>`).join('');
+ }catch(e){$('docs').textContent='Could not connect to API'}
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function ask(){
+ const q=$('question').value.trim();if(q.length<3){alert('Please enter a question with at least 3 characters.');return}
+ $('askBtn').disabled=true;$('busy').classList.remove('hidden');
+ try{
+  const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:q,top_k:3})});
+  const data=await r.json();if(!r.ok)throw new Error(data.detail||'Request failed');
+  $('resultPanel').classList.remove('hidden');
+  $('supportStatus').innerHTML=`<span class="status ${data.supported?'good':'bad'}">${data.supported?'✓ Evidence-supported response':'⚠ Insufficient / unverified evidence'}</span>`;
+  $('answer').textContent=data.answer;
+  $('meta').textContent=`Retrieval score: ${data.retrieval_score} · Grounding overlap: ${data.grounding_overlap??'N/A'} · ${data.latency_ms} ms · ${data.llm_used?'LLM generated':'Extractive fallback'}`;
+  $('sources').innerHTML=(data.retrieval_evidence||[]).map(s=>`<div class="source"><b>${escapeHtml(s.source)}</b> <span class="score">· ${escapeHtml(s.chunk_id)} · score ${s.score}</span><p>${escapeHtml(s.text)}</p></div>`).join('')||'<p class="sub">No source evidence passed the retrieval threshold.</p>';
+  $('resultPanel').scrollIntoView({behavior:'smooth',block:'start'});
+ }catch(e){$('resultPanel').classList.remove('hidden');$('answer').textContent='Error: '+e.message}
+ finally{$('askBtn').disabled=false;$('busy').classList.add('hidden')}
+}
+async function evaluateTests(){
+ $('evalResult').textContent='Running tests…';
+ try{const d=await fetch('/api/evaluate').then(r=>r.json());$('evalResult').innerHTML=`<b>Source hit rate: ${(d.source_hit_rate*100).toFixed(1)}%</b><br>${d.tests.map(t=>(t.source_hit?'✓':'✗')+' '+escapeHtml(t.expected_source)).join('<br>')}<br><small>${escapeHtml(d.note)}</small>`}
+ catch(e){$('evalResult').textContent='Evaluation failed: '+e.message}
+}
+loadStatus();
+</script>
+</body></html>
+
+========================================================================================
+FILE: README.md
+========================================================================================
+# Greenko Energy Intelligence – AI Operations Assistant
+
+A responsive, document-grounded RAG prototype built for the Greenko candidate case study.
+
+## Features
+- Loads the four supplied Markdown operational documents.
+- Word-based chunking with source metadata.
+- Dense embeddings using `sentence-transformers/all-MiniLM-L6-v2`.
+- Cosine similarity retrieval.
+- Optional Groq LLM answer generation (API key required).
+- Extractive fallback when no LLM key is configured.
+- Source citations and retrieved evidence.
+- Low-retrieval-score abstention and a heuristic grounding check.
+- Evaluation endpoint using the supplied `questions.csv`.
+- Responsive HTML/CSS/JavaScript frontend.
+
+## Run locally (Windows PowerShell)
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+# Optional: copy .env.example to .env and set GROQ_API_KEY
+uvicorn app:app --reload
+```
+
+Open http://127.0.0.1:8000
+
+If PowerShell blocks activation:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+## Optional Groq LLM
+1. Create an account at https://console.groq.com/
+2. Create an API key.
+3. Set `GROQ_API_KEY` as an environment variable or in a local `.env` file (do not commit it).
+4. The app uses the configured `GROQ_MODEL`, default `openai/gpt-oss-20b`.
+5. Without a key, the app still works with a source-text extractive fallback.
+
+The project loads a local `.env` file automatically. On Railway, add the same values under service Variables.
+
+## API
+- `GET /api/health` – status, document/chunk count and model mode.
+- `GET /api/documents` – indexed documents.
+- `POST /api/run` – `{ "text": "question", "top_k": 3 }`.
+- `GET /api/evaluate` – source hit-rate evaluation using `data/questions.csv`.
+
+## Deploy to Railway
+1. Push this project to GitHub.
+2. In Railway, create a project and choose Deploy from GitHub Repo.
+3. Select this repository.
+4. Set start command to `uvicorn app:app --host 0.0.0.0 --port $PORT` if Railway does not detect the Procfile.
+5. Add `GROQ_API_KEY` as a Railway variable if using Groq. Never put API keys in Git.
+6. Wait for deployment and open the generated domain.
+7. Test `/`, `/api/health`, `/api/run`, and `/api/evaluate`.
+
+## Design and safety limitations
+- The supplied knowledge base contains only four short documents.
+- The supplied labelled evaluation CSV contains only two questions; the reported source hit rate is not a statistically reliable production benchmark.
+- The TF-IDF fallback is lexical retrieval, not dense semantic embeddings. The normal intended mode is Sentence Transformers.
+- The grounding overlap score is a heuristic, not a formal factuality guarantee.
+- The prototype is not connected to SCADA, CMMS, plant telemetry, or live operational systems.
+- It must not replace approved procedures, permit-to-work, lockout-tagout, control-room authorization, or qualified engineering judgment.
+- For real deployment, expand and validate the corpus, add access control, audit logs, robust evaluation, monitoring, and human approval workflows.
+
+
+========================================================================================
+FILE: PROJECT_EXPLANATION.txt
+========================================================================================
+GREENKO ENERGY INTELLIGENCE – PROJECT EXPLANATION
+
+1. PROBLEM
+Operations staff may need to search multiple renewable-energy SOPs and safety notes. The assistant retrieves relevant passages and answers only from the supplied knowledge base.
+
+2. WHAT IS RAG?
+Retrieval-Augmented Generation combines information retrieval with a language model.
+Instead of asking an LLM to answer only from its training data, we first retrieve relevant document passages and give those passages to the LLM as context.
+
+3. PIPELINE
+A. Ingestion: read .md files from data/.
+B. Chunking: split documents into manageable word windows and retain filename/chunk metadata.
+C. Embeddings: SentenceTransformer all-MiniLM-L6-v2 converts each chunk into a dense numeric vector.
+D. Index: store vectors in memory for this prototype.
+E. Retrieval: embed the question and calculate cosine similarity to find top-k chunks.
+F. Generation: optional Groq chat completion receives the question and retrieved context.
+G. Citation: filenames and chunk IDs are returned with the answer.
+H. Guardrails: low retrieval scores cause abstention; a token-overlap heuristic flags answers with weak evidence.
+I. Evaluation: expected_source values in questions.csv are compared with retrieved source filenames.
+
+4. WHY THESE TOOLS?
+FastAPI: lightweight Python REST API.
+Sentence Transformers: local open-source embedding model; no paid embedding API is needed.
+NumPy: vector calculations.
+scikit-learn: cosine similarity and a TF-IDF fallback.
+Groq: optional hosted LLM inference; the selected model ID is configurable and availability/rate limits depend on account/model.
+HTML/CSS/JavaScript: lightweight responsive frontend, no frontend build step.
+Railway: deployment target specified by the case study.
+GitHub: source-code versioning and submission link.
+
+5. WHAT HAPPENS WHEN A USER ASKS A QUESTION?
+Example: "What should be checked for inverter derating?"
+- Query is sent to POST /api/run.
+- Query is converted into a vector.
+- Similarity search selects solar_inverter_sop.md.
+- Retrieved text is sent to Groq if configured.
+- The answer and source evidence are returned.
+- If retrieval confidence is too low, the system refuses to guess.
+
+6. DEMO QUESTIONS
+- What should be checked for inverter derating?
+- How should gearbox vibration be investigated?
+- What checks are required before spillway gate inspection?
+- What should be reviewed when generation deviates from forecast?
+- What is the procedure for repairing a nuclear reactor? (should abstain)
+
+7. IMPORTANT LIMITATIONS TO SAY HONESTLY
+- Only four short source documents were supplied.
+- Only two labelled evaluation questions were supplied.
+- Similarity threshold and grounding overlap are heuristics and need calibration.
+- The assistant is not connected to live plant telemetry or SCADA.
+- This is a prototype, not a certified safety system.
+- Operational decisions must follow approved Greenko procedures and qualified personnel.
+
+8. PRESENTATION SCRIPT
+"I built a document-grounded RAG assistant for renewable-energy operations. The system ingests the supplied solar, wind, hydro and grid documents, chunks the content, generates embeddings using Sentence Transformers, and retrieves relevant chunks using cosine similarity. The retrieved evidence is passed to an LLM through Groq when configured. The response includes source citations and retrieved evidence. If the documents do not provide sufficient support, the system abstains rather than inventing an answer. I also added a small evaluation endpoint that checks retrieved source documents against the expected sources in the supplied CSV."
+
+9. LIKELY INTERVIEW QUESTIONS
+Q: Why RAG instead of fine-tuning?
+A: The source documents can change. RAG lets us update the knowledge base without retraining a model and gives source evidence for answers.
+
+Q: What are embeddings?
+A: Numeric vector representations of text that help compare semantic similarity.
+
+Q: What is cosine similarity?
+A: A measure of the angle between two vectors. A higher score generally indicates greater similarity in direction.
+
+Q: Why chunk documents?
+A: Smaller passages improve retrieval precision and keep context focused. Metadata preserves the original source.
+
+Q: What is hallucination?
+A: An answer that sounds plausible but is not supported by evidence. We reduce risk using context-only prompts, retrieval thresholds, citations, and a grounding heuristic.
+
+Q: Is your hallucination check perfect?
+A: No. It is a heuristic. Production needs claim-level verification, curated tests, human review, and monitoring.
+
+Q: What is the evaluation metric?
+A: Source hit rate: the fraction of labelled questions for which the expected source appears in the retrieved results. With only two supplied labels, it is a smoke test, not a robust benchmark.
+
+Q: What happens if Groq is unavailable?
+A: The application returns source text through an extractive fallback, so retrieval and citations remain demonstrable.
+
+Q: Is this safe for actual plant control?
+A: No. It is a decision-support prototype, not a control system. Approved procedures and qualified staff remain authoritative.

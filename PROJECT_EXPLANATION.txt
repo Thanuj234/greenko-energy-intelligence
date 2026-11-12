@@ -1,0 +1,84 @@
+GREENKO ENERGY INTELLIGENCE – PROJECT EXPLANATION
+
+1. PROBLEM
+Operations staff may need to search multiple renewable-energy SOPs and safety notes. The assistant retrieves relevant passages and answers only from the supplied knowledge base.
+
+2. WHAT IS RAG?
+Retrieval-Augmented Generation combines information retrieval with a language model.
+Instead of asking an LLM to answer only from its training data, we first retrieve relevant document passages and give those passages to the LLM as context.
+
+3. PIPELINE
+A. Ingestion: read .md files from data/.
+B. Chunking: split documents into manageable word windows and retain filename/chunk metadata.
+C. Embeddings: SentenceTransformer all-MiniLM-L6-v2 converts each chunk into a dense numeric vector.
+D. Index: store vectors in memory for this prototype.
+E. Retrieval: embed the question and calculate cosine similarity to find top-k chunks.
+F. Generation: optional Groq chat completion receives the question and retrieved context.
+G. Citation: filenames and chunk IDs are returned with the answer.
+H. Guardrails: low retrieval scores cause abstention; a token-overlap heuristic flags answers with weak evidence.
+I. Evaluation: expected_source values in questions.csv are compared with retrieved source filenames.
+
+4. WHY THESE TOOLS?
+FastAPI: lightweight Python REST API.
+Sentence Transformers: local open-source embedding model; no paid embedding API is needed.
+NumPy: vector calculations.
+scikit-learn: cosine similarity and a TF-IDF fallback.
+Groq: optional hosted LLM inference; the selected model ID is configurable and availability/rate limits depend on account/model.
+HTML/CSS/JavaScript: lightweight responsive frontend, no frontend build step.
+Railway: deployment target specified by the case study.
+GitHub: source-code versioning and submission link.
+
+5. WHAT HAPPENS WHEN A USER ASKS A QUESTION?
+Example: "What should be checked for inverter derating?"
+- Query is sent to POST /api/run.
+- Query is converted into a vector.
+- Similarity search selects solar_inverter_sop.md.
+- Retrieved text is sent to Groq if configured.
+- The answer and source evidence are returned.
+- If retrieval confidence is too low, the system refuses to guess.
+
+6. DEMO QUESTIONS
+- What should be checked for inverter derating?
+- How should gearbox vibration be investigated?
+- What checks are required before spillway gate inspection?
+- What should be reviewed when generation deviates from forecast?
+- What is the procedure for repairing a nuclear reactor? (should abstain)
+
+7. IMPORTANT LIMITATIONS TO SAY HONESTLY
+- Only four short source documents were supplied.
+- Only two labelled evaluation questions were supplied.
+- Similarity threshold and grounding overlap are heuristics and need calibration.
+- The assistant is not connected to live plant telemetry or SCADA.
+- This is a prototype, not a certified safety system.
+- Operational decisions must follow approved Greenko procedures and qualified personnel.
+
+8. PRESENTATION SCRIPT
+"I built a document-grounded RAG assistant for renewable-energy operations. The system ingests the supplied solar, wind, hydro and grid documents, chunks the content, generates embeddings using Sentence Transformers, and retrieves relevant chunks using cosine similarity. The retrieved evidence is passed to an LLM through Groq when configured. The response includes source citations and retrieved evidence. If the documents do not provide sufficient support, the system abstains rather than inventing an answer. I also added a small evaluation endpoint that checks retrieved source documents against the expected sources in the supplied CSV."
+
+9. LIKELY INTERVIEW QUESTIONS
+Q: Why RAG instead of fine-tuning?
+A: The source documents can change. RAG lets us update the knowledge base without retraining a model and gives source evidence for answers.
+
+Q: What are embeddings?
+A: Numeric vector representations of text that help compare semantic similarity.
+
+Q: What is cosine similarity?
+A: A measure of the angle between two vectors. A higher score generally indicates greater similarity in direction.
+
+Q: Why chunk documents?
+A: Smaller passages improve retrieval precision and keep context focused. Metadata preserves the original source.
+
+Q: What is hallucination?
+A: An answer that sounds plausible but is not supported by evidence. We reduce risk using context-only prompts, retrieval thresholds, citations, and a grounding heuristic.
+
+Q: Is your hallucination check perfect?
+A: No. It is a heuristic. Production needs claim-level verification, curated tests, human review, and monitoring.
+
+Q: What is the evaluation metric?
+A: Source hit rate: the fraction of labelled questions for which the expected source appears in the retrieved results. With only two supplied labels, it is a smoke test, not a robust benchmark.
+
+Q: What happens if Groq is unavailable?
+A: The application returns source text through an extractive fallback, so retrieval and citations remain demonstrable.
+
+Q: Is this safe for actual plant control?
+A: No. It is a decision-support prototype, not a control system. Approved procedures and qualified staff remain authoritative.

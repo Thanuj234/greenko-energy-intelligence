@@ -1,0 +1,11 @@
+﻿question,expected_source
+What should be checked for inverter derating?,solar_inverter_sop.md
+How should gearbox vibration be investigated?,wind_turbine_maintenance.md
+What should be inspected when inverter temperature exceeds 75C?,solar_inverter_sop.md
+What should be done if an inverter repeatedly experiences derating?,solar_inverter_sop.md
+What checks are required when a wind turbine has high gearbox vibration?,wind_turbine_maintenance.md
+What factors should be checked when nacelle temperature rises?,wind_turbine_maintenance.md
+What must be verified before inspecting spillway gates?,hydro_safety_brief.md
+What safety preparations are required before spillway gate inspection?,hydro_safety_brief.md
+What information should be reviewed during generation deviation analysis?,grid_operations_note.md
+What factors should be considered when reviewing grid generation deviations?,grid_operations_note.md
