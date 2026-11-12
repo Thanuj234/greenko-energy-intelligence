@@ -155,7 +155,7 @@ class RAGEngine:
         threshold = float(
             os.getenv(
                 "RETRIEVAL_THRESHOLD",
-                "0.12" if "tfidf" in self.embedding_mode else "0.25"
+                "0.12" if "tfidf" in self.embedding_mode else "0.30"
             )
         )
 
